@@ -188,7 +188,9 @@ class RoomRecorderBot:
         stream_out = None
         frame_count = 0
         last_pts = -1
+        first_frame_us: int | None = None  # Timestamp µs của frame đầu tiên (gốc từ sender)
         FPS = 30
+        TIME_BASE = Fraction(1, 1_000_000)  # µs time base cho PTS
 
         try:
             # pyrefly: ignore [missing-import]
@@ -210,7 +212,7 @@ class RoomRecorderBot:
                     stream_out.width = w2
                     stream_out.height = h2
                     stream_out.pix_fmt = "yuv420p"
-                    stream_out.time_base = Fraction(1, FPS)
+                    stream_out.time_base = TIME_BASE  # µs time base để đồng bộ với PTS từ frame
                     stream_out.bit_rate = 3_500_000
                     stream_out.options = {
                         "deadline": "good",
@@ -219,15 +221,23 @@ class RoomRecorderBot:
                     }
                     logger.info("Khởi tạo WebM encoder %dx%d -> %s", w2, h2, webm_path.name)
 
-                t = self.now() - start_ts
-                pts = int(round(t * FPS))
+                # Lấy timestamp gốc (µs) từ sender qua LiveKit để tính PTS chính xác.
+                # Tránh dùng đồng hồ local (self.now()) vì khi CPU tắc nghẽn hoặc
+                # encode nặng, nhiều frame bị dồn lại → PTS không phản ánh thời gian thực
+                # → video phát nhanh hơn gốc.
+                frame_us: int = event.timestamp_us
+                if first_frame_us is None:
+                    first_frame_us = frame_us
+
+                # PTS tính theo µs từ đầu stream, dùng time_base = 1/1_000_000
+                pts = frame_us - first_frame_us
                 if pts <= last_pts:
                     pts = last_pts + 1
                 last_pts = pts
 
                 video_frame = av.VideoFrame.from_ndarray(rgb, format="rgb24")
                 video_frame.pts = pts
-                video_frame.time_base = Fraction(1, FPS)
+                video_frame.time_base = TIME_BASE
 
                 for packet in stream_out.encode(video_frame):
                     writer.mux(packet)
