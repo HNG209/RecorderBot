@@ -1,0 +1,40 @@
+# Environment variables (Credentials & Secrets)
+.env
+.env.*
+!.env.example
+
+# Recordings directory (Local temporary audio & video raw files)
+recordings/
+recordings/*
+
+# Python virtual environment
+venv/
+.venv/
+env/
+ENV/
+
+# Python cache & compiled files
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+
+# Distribution / packaging
+build/
+dist/
+*.egg-info/
+
+# Unit test & coverage caches
+.pytest_cache/
+.coverage
+htmlcov/
+
+# IDE & Editor settings
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# OS generated files
+.DS_Store
+Thumbs.db
