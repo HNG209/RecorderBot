@@ -47,7 +47,8 @@ def build_ffmpeg_cmd(
     - Dùng 1 nền đen (lavfi color) làm base video.
     - Overlay từng đoạn screen lên đúng thời điểm start/end của nó.
     - Mix audio từ tất cả các track (amerge nếu nhiều người, amix/copy nếu 1 người).
-    - startOffset = screen.start - earliest_audio.start (neo theo audio sớm nhất)
+    - global_t0 = min(tất cả audio.start + screen.start) → mốc t=0 tuyệt đối.
+    - Mỗi track (audio/screen) đều tính offset = track.start - global_t0.
     """
     audio_segments = timeline.get("audio_segments", [])
     screen_segments = timeline.get("screen_segments", [])
@@ -56,8 +57,13 @@ def build_ffmpeg_cmd(
         print("[ERROR] Không tìm thấy audio segment trong timeline.json")
         sys.exit(1)
 
-    # Lấy điểm bắt đầu sớm nhất của audio làm mốc t=0
-    audio_t0 = min(seg["start"] for seg in audio_segments)
+    # Lấy điểm bắt đầu sớm nhất trong TẤT CẢ các track (audio + screen) làm mốc t=0.
+    # Điều này đảm bảo dù audio hay screen bắt đầu trước, timeline vẫn luôn khớp.
+    all_starts = [seg["start"] for seg in audio_segments] + [
+        seg["start"] for seg in screen_segments if seg.get("file")
+    ]
+    global_t0 = min(all_starts) if all_starts else 0.0
+    print(f"[INFO] global_t0    : {global_t0:.3f}s")
 
     # --- Build input list ---
     # Input 0: nền đen
@@ -66,18 +72,20 @@ def build_ffmpeg_cmd(
 
     # Input 1..N: các file audio WAV
     audio_input_indices = []
-    for i, seg in enumerate(audio_segments):
+    # current_input_idx theo dõi index ffmpeg input thực tế (0 = nền đen)
+    current_input_idx = 1
+    for seg in audio_segments:
         audio_file = session_dir / seg["file"]
         if not audio_file.exists():
             print(f"[WARN] File audio không tồn tại: {audio_file}, bỏ qua.")
             continue
         cmd += ["-i", str(audio_file)]
-        audio_input_indices.append((len(audio_input_indices) + 1, seg))
+        audio_input_indices.append((current_input_idx, seg))
+        current_input_idx += 1
 
     # Input N+1..M: các file screen WebM
     screen_input_indices = []
-    base_idx = len(audio_input_indices) + 1
-    for i, seg in enumerate(screen_segments):
+    for seg in screen_segments:
         if not seg.get("file"):
             continue
         screen_file = session_dir / seg["file"]
@@ -87,14 +95,17 @@ def build_ffmpeg_cmd(
 
         # Lấy duration thực từ ffprobe (chính xác hơn timeline)
         real_dur = get_real_duration(screen_file)
-        start_offset = max(0.0, seg["start"] - audio_t0)
+        # start_offset tính từ global_t0 (mốc sớm nhất của toàn session)
+        start_offset = max(0.0, seg["start"] - global_t0)
         if real_dur:
             end_offset = start_offset + real_dur
         else:
-            end_offset = max(start_offset, seg["end"] - audio_t0)
+            end_offset = max(start_offset, seg["end"] - global_t0)
 
         cmd += ["-i", str(screen_file)]
-        screen_input_indices.append((base_idx + i, seg, start_offset, end_offset))
+        # Lưu current_input_idx thực tế (không dùng base_idx + i vì có thể bị skip)
+        screen_input_indices.append((current_input_idx, seg, start_offset, end_offset))
+        current_input_idx += 1
 
     if not screen_input_indices and not audio_input_indices:
         print("[ERROR] Không có file media hợp lệ nào để ghép.")
@@ -109,12 +120,14 @@ def build_ffmpeg_cmd(
         shifted_label = f"shifted{idx}"
         overlay_label = f"vout{idx}"
 
-        # Scale + pad về 1920x1080, rồi dịch PTS về đúng vị trí thời gian
+        # Scale + pad về 1920x1080, rồi dịch PTS về đúng vị trí thời gian.
+        # Luôn dùng (PTS-STARTPTS) để reset về 0 trước (dù webm bắt đầu lúc nào),
+        # sau đó mới cộng start_offset để đặt vào đúng vị trí trên timeline.
         filter_parts.append(
             f"[{idx}:v]"
             f"scale=1920:1080:force_original_aspect_ratio=decrease,"
             f"pad=1920:1080:(ow-iw)/2:(oh-ih)/2,"
-            f"setpts=PTS-STARTPTS+{start_offset}/TB"
+            f"setpts=(PTS-STARTPTS)+{start_offset}/TB"
             f"[{shifted_label}]"
         )
         filter_parts.append(
@@ -124,15 +137,39 @@ def build_ffmpeg_cmd(
         )
         last_video_out = overlay_label
 
-    # Mix audio nếu có nhiều track
-    if len(audio_input_indices) > 1:
-        audio_inputs = "".join(f"[{idx}:a]" for idx, _ in audio_input_indices)
+    # Delay + mix audio
+    # Mỗi audio track cần được delay đúng vị trí trên timeline (tính từ global_t0).
+    delayed_audio_labels = []
+    for idx, seg in audio_input_indices:
+        audio_delay_ms = max(0.0, (seg["start"] - global_t0) * 1000)
+        delayed_label = f"adelayed{idx}"
+        if audio_delay_ms > 0:
+            # adelay={ms}:all=1 → delay tất cả channels đồng đều
+            filter_parts.append(
+                f"[{idx}:a]adelay={audio_delay_ms:.0f}:all=1[{delayed_label}]"
+            )
+            delayed_audio_labels.append(f"[{delayed_label}]")
+        else:
+            # Không cần delay, dùng trực tiếp
+            delayed_audio_labels.append(f"[{idx}:a]")
+
+    if len(delayed_audio_labels) > 1:
+        audio_inputs_str = "".join(delayed_audio_labels)
         filter_parts.append(
-            f"{audio_inputs}amix=inputs={len(audio_input_indices)}:duration=longest[aout]"
+            f"{audio_inputs_str}amix=inputs={len(delayed_audio_labels)}:duration=longest[aout]"
         )
         audio_map = "[aout]"
-    elif len(audio_input_indices) == 1:
-        audio_map = f"{audio_input_indices[0][0]}:a"
+    elif len(delayed_audio_labels) == 1:
+        label = delayed_audio_labels[0]
+        if label.startswith("[") and label.endswith("]") and "adelayed" in label:
+            # Đã đi qua adelay filter → dùng label
+            audio_map = label
+        elif label.startswith("[") and label.endswith("]"):
+            # Dạng [idx:a] → dùng trực tiếp, không qua filter
+            # Cần tách ra: map trực tiếp không cần filter_complex
+            audio_map = f"{audio_input_indices[0][0]}:a"
+        else:
+            audio_map = label
     else:
         audio_map = None
 
