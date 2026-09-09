@@ -28,6 +28,9 @@ class Settings:
     PORT: int = int(os.getenv("PORT", "8000"))
     LOG_LEVEL: str = os.getenv("LOG_LEVEL", "INFO")
 
+    # Webhook Configuration
+    WEBHOOK_URL: str = os.getenv("WEBHOOK_URL", "")
+
     @property
     def R2_ENDPOINT_URL(self) -> str:
         """Trả về endpoint URL cho Cloudflare R2."""
@@ -46,6 +49,11 @@ class Settings:
             and self.R2_BUCKET_NAME
             and (self.R2_ACCOUNT_ID or self._R2_ENDPOINT_URL)
         )
+
+    @property
+    def is_webhook_configured(self) -> bool:
+        """Kiểm tra xem Webhook URL đã được cấu hình chưa."""
+        return bool(self.WEBHOOK_URL and self.WEBHOOK_URL.strip())
 
 settings = Settings()
 
