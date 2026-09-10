@@ -1,3 +1,4 @@
+import asyncio
 import os
 import mimetypes
 from pathlib import Path
@@ -73,7 +74,7 @@ class R2StorageService:
             logger.error("Lỗi tạo presigned URL cho %s: %s", object_key, e)
             return None
 
-    def upload_file(self, local_path: Path, object_key: str) -> Optional[Dict[str, Any]]:
+    async def upload_file(self, local_path: Path, object_key: str) -> Optional[Dict[str, Any]]:
         """Upload một file đơn lẻ lên Cloudflare R2."""
         if not self.is_available:
             logger.warning("Bỏ qua upload %s do R2 chưa được cấu hình.", local_path.name)
@@ -105,11 +106,21 @@ class R2StorageService:
 
         try:
             extra_args = {"ContentType": content_type}
-            self._client.upload_file(
-                Filename=str(local_path),
-                Bucket=settings.R2_BUCKET_NAME,
-                Key=object_key,
-                ExtraArgs=extra_args,
+            # boto3.upload_file() là blocking synchronous I/O.
+            # Offload sang thread pool để không block asyncio event loop.
+            loop = asyncio.get_event_loop()
+            _client = self._client
+            _bucket = settings.R2_BUCKET_NAME
+            _filename = str(local_path)
+
+            await loop.run_in_executor(
+                None,
+                lambda: _client.upload_file(
+                    Filename=_filename,
+                    Bucket=_bucket,
+                    Key=object_key,
+                    ExtraArgs=extra_args,
+                ),
             )
             logger.info("Upload thành công: %s -> %s", local_path.name, object_key)
 
@@ -128,7 +139,7 @@ class R2StorageService:
             logger.exception("Lỗi không xác định khi upload %s lên R2: %s", local_path.name, e)
             return None
 
-    def upload_directory(self, dir_path: Path, prefix: str = "") -> List[Dict[str, Any]]:
+    async def upload_directory(self, dir_path: Path, prefix: str = "") -> List[Dict[str, Any]]:
         """Upload toàn bộ file thô trong thư mục lên R2 với prefix tương ứng."""
         if not self.is_available:
             logger.warning("Bỏ qua upload thư mục %s do R2 chưa cấu hình.", dir_path)
@@ -147,7 +158,7 @@ class R2StorageService:
                 rel_path = file_path.relative_to(dir_path).as_posix()
                 object_key = f"{prefix}/{rel_path}" if prefix else rel_path
 
-                result = self.upload_file(file_path, object_key)
+                result = await self.upload_file(file_path, object_key)
                 if result:
                     uploaded_results.append(result)
 

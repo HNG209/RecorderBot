@@ -1,3 +1,4 @@
+from livekit.rtc._proto.track_publication_pb2 import VIDEO_QUALITY_HIGH
 import asyncio
 import json
 import shutil
@@ -109,6 +110,13 @@ class RoomRecorderBot:
                 track.kind == rtc.TrackKind.KIND_VIDEO
                 and publication.source == rtc.TrackSource.SOURCE_SCREENSHARE
             ):
+                try:
+                    if getattr(publication, "simulcasted", False):
+                        publication.set_video_quality(rtc.VideoQuality.VIDEO_QUALITY_HIGH)
+                        logger.info("Đã request VIDEO_QUALITY_HIGH cho screen %s", publication.sid)
+                except Exception as e:
+                    logger.warning("Không set được video quality: %s", e)
+
                 t = asyncio.create_task(
                     self._record_screen(track, participant)
                 )
@@ -200,7 +208,12 @@ class RoomRecorderBot:
     async def _record_screen(
         self, track: rtc.Track, participant: rtc.RemoteParticipant
     ) -> None:
-        """Ghi stream Video chia sẻ màn hình ra file định dạng WebM (VP8)."""
+        """Ghi stream Video chia sẻ màn hình ra file WebM (VP8) bằng 1 worker thread riêng."""
+        # pyrefly: ignore [missing-import]
+        import av
+        import queue
+        import threading
+
         start_ts = self.now()
         safe_id = "".join(
             c if c.isalnum() or c in "-_" else "_"
@@ -209,18 +222,95 @@ class RoomRecorderBot:
         webm_path = self.output_dir / f"screen_{safe_id}_{int(start_ts)}.webm"
 
         stream = rtc.VideoStream(track)
-        writer = None
-        stream_out = None
+
+        # Queue truyền frame từ async task → worker thread
+        # maxsize=90 ≈ giữ tối đa ~3 giây frame (30fps) để tránh RAM tăng vô hạn
+        frame_queue: queue.Queue = queue.Queue(maxsize=90)
+
+        # Các biến dùng chung (chỉ worker thread ghi, main thread chỉ đọc ở cuối)
         frame_count = 0
         last_pts = -1
-        first_frame_us: int | None = None  # Timestamp µs của frame đầu tiên (gốc từ sender)
+        first_frame_us: int | None = None
+        writer = None
+        stream_out = None
+        encode_error: Exception | None = None
+
         FPS = 30
-        TIME_BASE = Fraction(1, 1_000_000)  # µs time base cho PTS
+        TIME_BASE = Fraction(1, 1_000_000)
+
+        def encoder_worker():
+            """Chạy trên 1 thread riêng, chuyên encode + mux."""
+            nonlocal writer, stream_out, frame_count, last_pts, first_frame_us, encode_error
+
+            try:
+                while True:
+                    item = frame_queue.get()
+                    if item is None:          # sentinel → kết thúc
+                        break
+
+                    rgb, frame_us, w2, h2 = item
+
+                    # Khởi tạo encoder khi nhận frame đầu tiên
+                    if writer is None:
+                        logger.info(
+                            "Screen nhận frame đầu: %dx%d từ %s",
+                            w2, h2, participant.identity,
+                        )
+                        writer = av.open(str(webm_path), mode="w", format="webm")
+                        stream_out = writer.add_stream("libvpx", rate=FPS)
+                        stream_out.width = w2
+                        stream_out.height = h2
+                        stream_out.pix_fmt = "yuv420p"
+                        stream_out.time_base = TIME_BASE
+                        stream_out.bit_rate = 2_500_000          # giảm nhẹ so với trước
+                        stream_out.options = {
+                            "deadline": "realtime",               # ưu tiên tốc độ
+                            "cpu-used": "6",                      # 0=chậm-chất lượng cao, 8=nhanh
+                            "crf": "18",
+                            "threads": "2",
+                        }
+                        logger.info("Khởi tạo WebM encoder %dx%d -> %s", w2, h2, webm_path.name)
+
+                    if first_frame_us is None:
+                        first_frame_us = frame_us
+
+                    pts = frame_us - first_frame_us
+                    if pts <= last_pts:
+                        pts = last_pts + 1
+                    last_pts = pts
+
+                    video_frame = av.VideoFrame.from_ndarray(rgb, format="rgb24")
+                    video_frame.pts = pts
+                    video_frame.time_base = TIME_BASE
+
+                    for packet in stream_out.encode(video_frame):
+                        writer.mux(packet)
+
+                    frame_count += 1
+
+            except Exception as e:
+                encode_error = e
+                logger.exception("Lỗi trong encoder worker của %s: %s", participant.identity, e)
+            finally:
+                # Flush encoder và đóng file
+                if writer is not None and stream_out is not None:
+                    try:
+                        for packet in stream_out.encode(None):
+                            writer.mux(packet)
+                        writer.close()
+                        logger.info("Đã flush & đóng WebM: %s (%d frames)", webm_path.name, frame_count)
+                    except Exception as e:
+                        logger.warning("Lỗi khi flush/close video writer: %s", e)
+
+        # Khởi động worker thread (daemon để không chặn process khi tắt app)
+        worker = threading.Thread(
+            target=encoder_worker,
+            name=f"screen-encoder-{safe_id}",
+            daemon=True,
+        )
+        worker.start()
 
         try:
-            # pyrefly: ignore [missing-import]
-            import av
-
             async for event in stream:
                 frame = event.frame
                 frame_bgra = frame.convert(rtc.VideoBufferType.BGRA)
@@ -231,71 +321,51 @@ class RoomRecorderBot:
                 arr = np.frombuffer(frame_bgra.data, dtype=np.uint8).reshape(h, w, 4)
                 rgb = arr[:h2, :w2, :][:, :, [2, 1, 0]].copy()
 
-                if writer is None:
-                    writer = av.open(str(webm_path), mode="w", format="webm")
-                    stream_out = writer.add_stream("libvpx", rate=FPS)
-                    stream_out.width = w2
-                    stream_out.height = h2
-                    stream_out.pix_fmt = "yuv420p"
-                    stream_out.time_base = TIME_BASE  # µs time base để đồng bộ với PTS từ frame
-                    stream_out.bit_rate = 3_500_000
-                    stream_out.options = {
-                        "deadline": "good",
-                        "cpu-used": "4",
-                        "crf": "12",
-                    }
-                    logger.info("Khởi tạo WebM encoder %dx%d -> %s", w2, h2, webm_path.name)
-
-                # Lấy timestamp gốc (µs) từ sender qua LiveKit để tính PTS chính xác.
-                # Tránh dùng đồng hồ local (self.now()) vì khi CPU tắc nghẽn hoặc
-                # encode nặng, nhiều frame bị dồn lại → PTS không phản ánh thời gian thực
-                # → video phát nhanh hơn gốc.
                 frame_us: int = event.timestamp_us
-                if first_frame_us is None:
-                    first_frame_us = frame_us
 
-                # PTS tính theo µs từ đầu stream, dùng time_base = 1/1_000_000
-                pts = frame_us - first_frame_us
-                if pts <= last_pts:
-                    pts = last_pts + 1
-                last_pts = pts
+                # Đưa frame vào queue. Nếu queue đầy → bỏ frame (tránh block + tăng RAM)
+                try:
+                    frame_queue.put_nowait((rgb, frame_us, w2, h2))
+                except queue.Full:
+                    # Có thể log thỉnh thoảng nếu muốn theo dõi drop frame
+                    pass
 
-                video_frame = av.VideoFrame.from_ndarray(rgb, format="rgb24")
-                video_frame.pts = pts
-                video_frame.time_base = TIME_BASE
-
-                for packet in stream_out.encode(video_frame):
-                    writer.mux(packet)
-                frame_count += 1
-
-        except ImportError:
-            logger.error("Thư viện `av` (PyAV) chưa được cài đặt.")
-            async for _ in stream:
-                frame_count += 1
         except asyncio.CancelledError:
             pass
         except Exception as e:
-            logger.exception("Lỗi khi ghi Video màn hình từ %s: %s", participant.identity, e)
+            logger.exception("Lỗi khi đọc Video stream từ %s: %s", participant.identity, e)
         finally:
-            end_ts = self.now()
-            if writer is not None and stream_out is not None:
-                try:
-                    for packet in stream_out.encode(None):
-                        writer.mux(packet)
-                    writer.close()
-                except Exception as e:
-                    logger.warning("Lỗi flush/close video writer: %s", e)
+            # Báo worker dừng lại
+            try:
+                frame_queue.put(None, timeout=1.0)
+            except Exception:
+                pass
 
+            # Chờ worker flush xong (tối đa 12 giây)
+            worker.join(timeout=12.0)
+
+            if worker.is_alive():
+                logger.warning(
+                    "Encoder worker của %s vẫn còn chạy sau 12s, bỏ qua chờ thêm",
+                    participant.identity,
+                )
+
+            end_ts = self.now()
             real_dur = round(end_ts - start_ts, 3)
+
             seg = {
                 "participant": participant.identity,
                 "start": round(start_ts, 3),
                 "end": round(end_ts, 3),
                 "frames": frame_count,
                 "real_duration_sec": real_dur,
-                "file": webm_path.name if (frame_count and webm_path.exists()) else None,
+                "file": webm_path.name if (frame_count > 0 and webm_path.exists()) else None,
             }
             self.screen_segments.append(seg)
+
+            if encode_error:
+                logger.error("Encoder worker kết thúc với lỗi: %s", encode_error)
+
             logger.info(
                 "Hoàn thành ghi Screen: real=%.2fs | frames=%d | file=%s",
                 real_dur,
@@ -354,21 +424,27 @@ class RoomRecorderBot:
         self.is_running = False
         logger.info("Đang dừng bot ghi hình phòng '%s'...", self.room_name)
 
-        # 1. Phát thông báo is_recording=False qua data channel trước khi ngắt kết nối
+        # Phát thông báo is_recording=False qua data channel trước khi ngắt kết nối
         try:
             await self.publish_recording_status(is_recording=False)
             await asyncio.sleep(0.1)  # Đợi 100ms để gói tin truyền qua DataChannel
         except Exception as e:
             logger.warning("Lỗi khi phát trạng thái dừng qua Data Channel: %s", e)
 
-        # 2. Cancel toàn bộ tasks ghi stream
+        # Cancel toàn bộ tasks ghi stream
         for t in self._tasks:
             t.cancel()
+
         if self._tasks:
-            await asyncio.gather(*self._tasks, return_exceptions=True)
+            try:
+                await asyncio.wait_for(
+                    asyncio.gather(*self._tasks, return_exceptions=True),
+                    timeout=15.0,
+                )
+            except asyncio.TimeoutError:
+                logger.warning("Timeout khi chờ các task ghi kết thúc")
             self._tasks.clear()
 
-        # 3. Ngắt kết nối phòng
         try:
             await self.room.disconnect()
         except Exception as e:
@@ -498,7 +574,7 @@ class RecorderManager:
                 bot.output_dir,
                 r2_prefix,
             )
-            uploaded_files = r2_storage.upload_directory(bot.output_dir, prefix=r2_prefix)
+            uploaded_files = await r2_storage.upload_directory(bot.output_dir, prefix=r2_prefix)
 
             # 3. Dọn dẹp thư mục local sau khi upload R2 hoàn tất
             should_cleanup = (
@@ -545,6 +621,50 @@ class RecorderManager:
             auto_upload_r2=auto_upload_r2,
             cleanup_local=cleanup_local,
         )
+
+    def pop_bot(self, room_name: str) -> RoomRecorderBot:
+        """Tách bot ra khỏi danh sách active ngay lập tức (không I/O, không block).
+        Dùng kết hợp với FastAPI BackgroundTasks để đảm bảo 204 trả về trước
+        khi bất kỳ tác vụ nặng nào bắt đầu chạy.
+        """
+        bot = self._active_bots.pop(room_name, None)
+        if not bot:
+            raise ValueError(f"Không tìm thấy phiên ghi nào đang hoạt động cho phòng '{room_name}'.")
+        bot.is_running = False
+        return bot
+
+    async def run_stop_background_task(
+        self,
+        bot: RoomRecorderBot,
+        auto_upload_r2: bool = True,
+        cleanup_local: Optional[bool] = None,
+        webhook_callback: bool = True,
+    ) -> None:
+        """Coroutine thực hiện toàn bộ tác vụ dừng bot, upload R2 và bắn webhook.
+        Được gọi bởi FastAPI BackgroundTasks sau khi response 204 đã gửi xong.
+        """
+        try:
+            result = await self._finish_stop_and_upload(
+                bot=bot,
+                auto_upload_r2=auto_upload_r2,
+                cleanup_local=cleanup_local,
+            )
+            if webhook_callback:
+                try:
+                    from app.webhook import send_post_process_webhook
+                    await send_post_process_webhook(result)
+                except Exception as wh_err:
+                    logger.error(
+                        "Lỗi khi bắn webhook sau khi stop phòng %s: %s",
+                        bot.room_name,
+                        wh_err,
+                    )
+        except Exception as e:
+            logger.exception(
+                "Lỗi trong tác vụ background dừng phòng %s: %s",
+                bot.room_name,
+                e,
+            )
 
     async def stop_recording_background(
         self,

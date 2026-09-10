@@ -1,7 +1,7 @@
 from contextlib import asynccontextmanager
 
 import uvicorn
-from fastapi import FastAPI, HTTPException, status, Response
+from fastapi import BackgroundTasks, FastAPI, HTTPException, status, Response
 from fastapi.middleware.cors import CORSMiddleware
 
 from app.config import settings, logger
@@ -141,13 +141,15 @@ async def start_recording(request: StartRecordingRequest):
     response_class=Response,
     tags=["Recordings"],
 )
-async def stop_recording(request: StopRecordingRequest):
+async def stop_recording(request: StopRecordingRequest, background_tasks: BackgroundTasks):
     """
     Dừng ghi hình phòng LiveKit, lưu metadata timeline, tự động upload toàn bộ
     file chưa qua xử lý (.wav, .webm, timeline.json) lên Cloudflare R2,
     và tự động bắn webhook thông báo chi tiết folder cho service xử lý hậu kì.
-    Trả về 204 No Content khi dừng và upload thành công.
+    Trả về 204 No Content ngay lập tức; các tác vụ nặng (stop bot, upload R2, webhook)
+    được thực thi sau khi response đã gửi xong (FastAPI BackgroundTasks).
     """
+    logger.info("Đang dừng")
     room_name = request.room_name.strip()
     if not room_name:
         raise HTTPException(
@@ -162,10 +164,14 @@ async def stop_recording(request: StopRecordingRequest):
         )
 
     try:
-        # Dừng bot và thực thi upload R2, dọn dẹp local, bắn webhook bất đồng bộ trong background
-        # Trả về ngay lập tức cho client (204 No Content)
-        await recorder_manager.stop_recording_background(
-            room_name=room_name,
+        # pop_bot() chỉ xóa bot khỏi active list và set is_running=False — không I/O, không block.
+        # FastAPI BackgroundTasks đảm bảo response 204 được gửi đến client TRƯỚC KHI
+        # bất kỳ tác vụ background nào bắt đầu — khác với asyncio.create_task
+        # có thể chạy xen kế với quá trình gửi response.
+        bot = recorder_manager.pop_bot(room_name)
+        background_tasks.add_task(
+            recorder_manager.run_stop_background_task,
+            bot,
             auto_upload_r2=True,
             webhook_callback=True,
         )
