@@ -12,6 +12,7 @@ class StartRecordingResponse(BaseModel):
     message: str
     room_name: str
     session_id: str
+    recording_id: str
     output_dir: str
 
 
@@ -31,6 +32,7 @@ class StopRecordingResponse(BaseModel):
     message: str
     room_name: str
     session_id: str
+    recording_id: Optional[str] = None
     duration_sec: float
     local_output_dir: str
     timeline: Dict[str, Any]
@@ -40,6 +42,7 @@ class StopRecordingResponse(BaseModel):
 class RecordingStatusItem(BaseModel):
     room_name: str
     session_id: str
+    recording_id: Optional[str] = None
     status: str
     duration_sec: float
     output_dir: str

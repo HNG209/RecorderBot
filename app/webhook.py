@@ -14,12 +14,18 @@ def build_webhook_payload(recording_data: Dict[str, Any]) -> Dict[str, Any]:
     """
     room_name = recording_data.get("room_name", "")
     session_id = recording_data.get("session_id", "")
-    folder_prefix = f"recordings/{room_name}/{session_id}"
+    recording_id = recording_data.get("recording_id", "")
+
+    if recording_id:
+        folder_prefix = f"{room_name}/{session_id}/{recording_id}"
+    else:
+        folder_prefix = f"{room_name}/{session_id}"
 
     return {
         "event": "RECORDING_UPLOADED",
         "room_name": room_name,
         "session_id": session_id,
+        "recording_id": recording_id,
         "folder": folder_prefix,
         "duration_sec": recording_data.get("duration_sec", 0.0),
         "r2": {
@@ -32,7 +38,9 @@ def build_webhook_payload(recording_data: Dict[str, Any]) -> Dict[str, Any]:
     }
 
 
-def build_payload_from_session(room_name: str, session_id: str) -> Optional[Dict[str, Any]]:
+def build_payload_from_session(
+    room_name: str, session_id: str, recording_id: Optional[str] = None
+) -> Optional[Dict[str, Any]]:
     """
     Đọc thông tin từ session directory hiện có trên local để tạo payload webhook.
     Dùng cho trường hợp trigger webhook thủ công hoặc gửi lại webhook.
@@ -41,7 +49,30 @@ def build_payload_from_session(room_name: str, session_id: str) -> Optional[Dict
     if not session_dir.exists() or not session_dir.is_dir():
         return None
 
-    timeline_path = session_dir / "timeline.json"
+    target_dir: Optional[Path] = None
+    if recording_id:
+        cand_dir = session_dir / recording_id
+        if cand_dir.exists() and cand_dir.is_dir():
+            target_dir = cand_dir
+    else:
+        # Tìm thư mục rec_* mới nhất trong session_dir nếu có
+        rec_subdirs = [
+            d for d in session_dir.iterdir()
+            if d.is_dir() and d.name.startswith("rec_")
+        ]
+        if rec_subdirs:
+            rec_subdirs.sort(key=lambda d: d.stat().st_mtime, reverse=True)
+            target_dir = rec_subdirs[0]
+            recording_id = target_dir.name
+        elif (session_dir / "timeline.json").exists():
+            # Tương thích ngược với cấu trúc cũ
+            target_dir = session_dir
+            recording_id = None
+
+    if target_dir is None or not target_dir.is_dir():
+        return None
+
+    timeline_path = target_dir / "timeline.json"
     timeline = {}
     if timeline_path.exists():
         try:
@@ -49,11 +80,14 @@ def build_payload_from_session(room_name: str, session_id: str) -> Optional[Dict
         except Exception as e:
             logger.warning("Không thể đọc timeline.json tại %s: %s", timeline_path, e)
 
-    folder_prefix = f"recordings/{room_name}/{session_id}"
+    if recording_id:
+        folder_prefix = f"{room_name}/{session_id}/{recording_id}"
+    else:
+        folder_prefix = f"{room_name}/{session_id}"
 
-    # Quét tất cả file trong session dir
+    # Quét tất cả file trong target_dir
     files = []
-    for f in session_dir.iterdir():
+    for f in target_dir.iterdir():
         if f.is_file():
             obj_key = f"{folder_prefix}/{f.name}"
             public_url = (
@@ -73,8 +107,9 @@ def build_payload_from_session(room_name: str, session_id: str) -> Optional[Dict
     recording_data = {
         "room_name": room_name,
         "session_id": session_id,
+        "recording_id": recording_id or "",
         "duration_sec": timeline.get("duration_sec", 0.0),
-        "local_output_dir": str(session_dir),
+        "local_output_dir": str(target_dir),
         "timeline": timeline,
         "uploaded_files": files,
     }
@@ -104,9 +139,10 @@ async def send_post_process_webhook(
         payload = payload_or_data
 
     logger.info(
-        "[Webhook] Đang bắn webhook tới %s cho session '%s' (folder='%s')...",
+        "[Webhook] Đang bắn webhook tới %s cho session '%s' (rec='%s', folder='%s')...",
         url,
         payload.get("session_id"),
+        payload.get("recording_id", ""),
         payload.get("folder"),
     )
 

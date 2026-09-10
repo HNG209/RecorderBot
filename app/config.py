@@ -22,6 +22,9 @@ class Settings:
 
     # Local Directory Configuration
     RECORDINGS_DIR: Path = Path(os.getenv("RECORDINGS_DIR", "recordings"))
+    CLEANUP_LOCAL_AFTER_UPLOAD: bool = os.getenv(
+        "CLEANUP_LOCAL_AFTER_UPLOAD", "true"
+    ).lower() in ("true", "1", "yes")
 
     # Server Configuration
     HOST: str = os.getenv("HOST", "0.0.0.0")

@@ -1,25 +1,17 @@
 from contextlib import asynccontextmanager
-from typing import Dict, Any
 
 import uvicorn
 from fastapi import FastAPI, HTTPException, status, Response
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import JSONResponse
 
 from app.config import settings, logger
 from app.recorder import recorder_manager
-from app.r2_storage import r2_storage
-from app.webhook import send_post_process_webhook
 from app.schemas import (
     StartRecordingRequest,
-    StartRecordingResponse,
     StopRecordingRequest,
-    StopRecordingResponse,
     ActiveRecordingsResponse,
-    RecordingStatusItem,
     R2ConfigStatusResponse,
 )
-
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
@@ -45,6 +37,16 @@ async def lifespan(app: FastAPI):
                 await recorder_manager.stop_recording(room_name, auto_upload_r2=True)
             except Exception as e:
                 logger.error("Lỗi dừng bot phòng %s khi shutdown: %s", room_name, e)
+
+    # Chờ các tác vụ background dừng bot / upload R2 hoàn tất nếu có
+    if recorder_manager._background_tasks:
+        logger.info(
+            "Đang chờ %d tác vụ background hoàn tất trước khi tắt server...",
+            len(recorder_manager._background_tasks),
+        )
+        import asyncio
+        await asyncio.gather(*recorder_manager._background_tasks, return_exceptions=True)
+
     logger.info("=== LiveKit Recorder Bot Service đã dừng ===")
 
 
@@ -55,7 +57,6 @@ app = FastAPI(
     lifespan=lifespan,
 )
 
-# Cho phép CORS cho frontend kết nối
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -161,18 +162,19 @@ async def stop_recording(request: StopRecordingRequest):
         )
 
     try:
-        result = await recorder_manager.stop_recording(
+        # Dừng bot và thực thi upload R2, dọn dẹp local, bắn webhook bất đồng bộ trong background
+        # Trả về ngay lập tức cho client (204 No Content)
+        await recorder_manager.stop_recording_background(
             room_name=room_name,
             auto_upload_r2=True,
+            webhook_callback=True,
         )
-
-        # Tự động bắn webhook thông báo chi tiết folder sau khi đã stop và upload lên R2
-        try:
-            await send_post_process_webhook(result)
-        except Exception as wh_err:
-            logger.error("Lỗi khi bắn webhook sau khi stop phòng %s: %s", room_name, wh_err)
-
         return Response(status_code=status.HTTP_204_NO_CONTENT)
+    except ValueError as e:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=str(e),
+        )
     except Exception as e:
         logger.exception("Lỗi khi gọi stop_recording: %s", e)
         raise HTTPException(
@@ -206,17 +208,11 @@ async def get_room_status(room_name: str):
         return {
             "room_name": room_name,
             "is_recording": False,
-            "message": "Không có phiên ghi nào đang hoạt động.",
         }
 
     return {
         "room_name": room_name,
         "is_recording": bot.is_running,
-        "session_id": bot.session_id,
-        "duration_sec": round(bot.now(), 2),
-        "output_dir": str(bot.output_dir),
-        "audio_segments_count": len(bot.audio_segments),
-        "screen_segments_count": len(bot.screen_segments),
     }
 
 

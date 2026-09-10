@@ -1,13 +1,13 @@
 """
 post_process.py - Test helper ghép audio + screen từ timeline.json bằng ffmpeg.
 
-Đầu vào: thư mục session chứa timeline.json + các file .wav / .webm
-Đầu ra: output.mp4 trong cùng thư mục session
+Đầu vào: thư mục recording chứa timeline.json + các file .wav / .webm
+Đầu ra: output.mp4 trong cùng thư mục recording
 
 Cách dùng:
-    python post_process.py recordings/meet-xxx/session_id
-    python post_process.py recordings/meet-xxx/session_id --out result.mp4
-VD: python post_process.py recordings\meet-6a80-ii70qip\string123 --out merged.mp4
+    python post_process.py recordings/meet-xxx/session_id/rec_randomId
+    python post_process.py recordings/meet-xxx/session_id/rec_randomId --out result.mp4
+VD: python post_process.py recordings\meet-6a80-ii70qip\string6\rec_8a1f2c3d --out merged.mp4
 """
 
 import argparse
