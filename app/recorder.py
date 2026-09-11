@@ -1,4 +1,3 @@
-from livekit.rtc._proto.track_publication_pb2 import VIDEO_QUALITY_HIGH
 import asyncio
 import json
 import shutil
@@ -15,6 +14,34 @@ from livekit import api, rtc
 from app.config import settings, logger
 from app.r2_storage import r2_storage
 
+def can_use_gstreamer() -> bool:
+    """Kiểm tra môi trường hiện tại có dùng được GStreamer không."""
+    try:
+        # pyrefly: ignore [missing-import]
+        import gi
+        gi.require_version("Gst", "1.0")
+        # pyrefly: ignore [missing-import]
+        from gi.repository import Gst
+        Gst.init(None)
+        logger.info("GStreamer import thành công, đang kiểm tra plugins...")
+
+        registry = Gst.Registry.get()
+        required = ["appsrc", "vp8enc", "webmmux", "videoconvert"]
+        for name in required:
+            found = registry.find_feature(name, Gst.ElementFactory)
+            if not found:
+                logger.warning("GStreamer plugin thiếu: '%s' → fallback sang PyAV", name)
+                return False
+            logger.debug("GStreamer plugin OK: %s", name)
+
+        logger.info("GStreamer sẵn sàng (tất cả plugins đều có mặt)")
+        return True
+    except ImportError as e:
+        logger.warning("Không thể import GStreamer (gi/PyGObject): %s → fallback sang PyAV", e)
+        return False
+    except Exception as e:
+        logger.warning("Lỗi khi kiểm tra GStreamer: %s → fallback sang PyAV", e)
+        return False
 
 def create_bot_token(room_name: str, bot_identity: str) -> str:
     """Tạo LiveKit Access Token cho bot tham gia ghi hình."""
@@ -33,7 +60,6 @@ def create_bot_token(room_name: str, bot_identity: str) -> str:
         )
         .to_jwt()
     )
-
 
 class RoomRecorderBot:
     """Bot kết nối vào phòng LiveKit để ghi lại các track âm thanh và chia sẻ màn hình."""
@@ -61,8 +87,8 @@ class RoomRecorderBot:
         self.room = rtc.Room()
         self.start_mono: Optional[float] = None
         self.start_wall_time: float = time.time()
-        self.screen_segments: List[Dict[str, Any]] = []
-        self.audio_segments: List[Dict[str, Any]] = []
+        self.screen_segments: List[Dict[str, Any]] = [] # Phân đoạn screen share
+        self.audio_segments: List[Dict[str, Any]] = [] # Phân đoạn audio
         self._tasks: List[asyncio.Task] = []
         self.is_running: bool = False
 
@@ -205,7 +231,152 @@ class RoomRecorderBot:
             else:
                 logger.warning("Track Audio từ %s không có dữ liệu!", participant.identity)
 
-    async def _record_screen(
+    async def _record_screen_gstreamer(
+        self, track: rtc.Track, participant: rtc.RemoteParticipant
+    ) -> None:
+        """Ghi screen share bằng GStreamer pipeline."""
+        # pyrefly: ignore [missing-import]
+        import gi
+        gi.require_version("Gst", "1.0")
+        # pyrefly: ignore [missing-import]
+        from gi.repository import Gst, GLib
+        import threading
+
+        Gst.init(None)
+
+        start_ts = self.now()
+        safe_id = "".join(
+            c if c.isalnum() or c in "-_" else "_"
+            for c in participant.identity
+        )
+        webm_path = self.output_dir / f"screen_{safe_id}_{int(start_ts)}.webm"
+
+        stream = rtc.VideoStream(track)
+
+        pipeline = None
+        appsrc = None
+        frame_count = 0
+        first_frame_us: int | None = None
+        main_loop = None
+        loop_thread = None
+
+        def on_bus_message(bus, message):
+            t = message.type
+            if t == Gst.MessageType.ERROR:
+                err, debug = message.parse_error()
+                logger.error("GStreamer ERROR: %s | debug: %s", err, debug)
+                if main_loop:
+                    main_loop.quit()
+            elif t == Gst.MessageType.EOS:
+                logger.info("GStreamer nhận EOS")
+                if main_loop:
+                    main_loop.quit()
+            return True
+
+        def start_pipeline(w: int, h: int):
+            nonlocal pipeline, appsrc, main_loop, loop_thread
+
+            pipeline_str = (
+                f"appsrc name=src is-live=true format=time do-timestamp=false "
+                f"! videoconvert "
+                f"! vp8enc deadline=1 cpu-used=6 target-bitrate=2500000 "
+                f"! webmmux "
+                f"! filesink location={webm_path}"
+            )
+
+            pipeline = Gst.parse_launch(pipeline_str)
+            appsrc = pipeline.get_by_name("src")
+
+            caps = Gst.Caps.from_string(
+                f"video/x-raw,format=RGB,width={w},height={h},framerate=30/1"
+            )
+            appsrc.set_property("caps", caps)
+            appsrc.set_property("format", Gst.Format.TIME)
+
+            bus = pipeline.get_bus()
+            bus.add_signal_watch()
+            bus.connect("message", on_bus_message)
+
+            main_loop = GLib.MainLoop()
+            loop_thread = threading.Thread(target=main_loop.run, daemon=True)
+            loop_thread.start()
+
+            pipeline.set_state(Gst.State.PLAYING)
+            logger.info("GStreamer pipeline đã chạy: %dx%d → %s", w, h, webm_path.name)
+
+        def push_frame(rgb: np.ndarray, frame_us: int):
+            nonlocal frame_count, first_frame_us
+
+            if appsrc is None:
+                return
+
+            if first_frame_us is None:
+                first_frame_us = frame_us
+
+            pts_ns = (frame_us - first_frame_us) * 1000  # µs → ns
+
+            data = rgb.tobytes()
+            buf = Gst.Buffer.new_allocate(None, len(data), None)
+            buf.fill(0, data)
+            buf.pts = pts_ns
+            buf.duration = Gst.util_uint64_scale_int(1, Gst.SECOND, 30)
+
+            ret = appsrc.emit("push-buffer", buf)
+            if ret == Gst.FlowReturn.OK:
+                frame_count += 1
+
+        try:
+            async for event in stream:
+                frame = event.frame
+                frame_bgra = frame.convert(rtc.VideoBufferType.BGRA)
+                w, h = frame_bgra.width, frame_bgra.height
+                w2 = w - (w % 2)
+                h2 = h - (h % 2)
+
+                arr = np.frombuffer(frame_bgra.data, dtype=np.uint8).reshape(h, w, 4)
+                rgb = arr[:h2, :w2, :][:, :, [2, 1, 0]].copy()
+
+                if pipeline is None:
+                    start_pipeline(w2, h2)
+
+                push_frame(rgb, event.timestamp_us)
+
+        except asyncio.CancelledError:
+            pass
+        except Exception as e:
+            logger.exception("Lỗi khi đọc Video stream từ %s: %s", participant.identity, e)
+        finally:
+            if appsrc is not None:
+                appsrc.emit("end-of-stream")
+
+            if loop_thread is not None:
+                loop_thread.join(timeout=15.0)
+
+            if pipeline is not None:
+                pipeline.set_state(Gst.State.NULL)
+
+            end_ts = self.now()
+            real_dur = round(end_ts - start_ts, 3)
+
+            seg = {
+                "participant": participant.identity,
+                "start": round(start_ts, 3),
+                "end": round(end_ts, 3),
+                "frames": frame_count,
+                "real_duration_sec": real_dur,
+                "file": webm_path.name if (frame_count > 0 and webm_path.exists()) else None,
+            }
+            self.screen_segments.append(seg)
+
+            logger.info(
+                "Hoàn thành ghi Screen (GStreamer): real=%.2fs | frames=%d | file=%s",
+                real_dur,
+                frame_count,
+                seg.get("file"),
+            )
+        
+    # Fallback nếu không chạy được GStreamer
+    async def _record_screen_pyav(
         self, track: rtc.Track, participant: rtc.RemoteParticipant
     ) -> None:
         """Ghi stream Video chia sẻ màn hình ra file WebM (VP8) bằng 1 worker thread riêng."""
@@ -372,6 +543,17 @@ class RoomRecorderBot:
                 frame_count,
                 seg.get("file"),
             )
+    
+    async def _record_screen(
+        self, track: rtc.Track, participant: rtc.RemoteParticipant
+    ) -> None:
+        """Tự động chọn GStreamer hoặc PyAV."""
+        if can_use_gstreamer():
+            logger.info("Sử dụng GStreamer")
+            await self._record_screen_gstreamer(track, participant)
+        else:
+            logger.info("Sử dụng PyAV")
+            await self._record_screen_pyav(track, participant)
 
     async def publish_recording_status(
         self,
