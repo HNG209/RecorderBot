@@ -13,6 +13,34 @@ from livekit import api, rtc
 
 from app.config import settings, logger
 from app.r2_storage import r2_storage
+import cv2
+
+OUT_W = settings.VIDEO_WIDTH
+OUT_H = settings.VIDEO_HEIGHT
+
+def fit_to_canvas(
+    rgb: np.ndarray,
+    out_w: Optional[int] = None,
+    out_h: Optional[int] = None,
+) -> np.ndarray:
+    target_w = out_w if out_w is not None else settings.VIDEO_WIDTH
+    target_h = out_h if out_h is not None else settings.VIDEO_HEIGHT
+
+    h, w = rgb.shape[:2]
+    if w <= 0 or h <= 0:
+        return np.zeros((target_h, target_w, 3), dtype=np.uint8)
+
+    scale = min(target_w / w, target_h / h)
+    new_w = max(1, int(round(w * scale))) // 2 * 2
+    new_h = max(1, int(round(h * scale))) // 2 * 2
+    interp = cv2.INTER_AREA if scale < 1 else cv2.INTER_LINEAR
+    resized = cv2.resize(rgb, (new_w, new_h), interpolation=interp)
+
+    canvas = np.zeros((target_h, target_w, 3), dtype=np.uint8)
+    x = (target_w - new_w) // 2
+    y = (target_h - new_h) // 2
+    canvas[y:y + new_h, x:x + new_w] = resized
+    return canvas
 
 def can_use_gstreamer() -> bool:
     """Kiểm tra môi trường hiện tại có dùng được GStreamer không."""
@@ -23,7 +51,6 @@ def can_use_gstreamer() -> bool:
         # pyrefly: ignore [missing-import]
         from gi.repository import Gst
         Gst.init(None)
-        logger.info("GStreamer import thành công, đang kiểm tra plugins...")
 
         registry = Gst.Registry.get()
         required = ["appsrc", "vp8enc", "webmmux", "videoconvert"]
@@ -32,7 +59,6 @@ def can_use_gstreamer() -> bool:
             if not found:
                 logger.warning("GStreamer plugin thiếu: '%s' → fallback sang PyAV", name)
                 return False
-            logger.debug("GStreamer plugin OK: %s", name)
 
         logger.info("GStreamer sẵn sàng (tất cả plugins đều có mặt)")
         return True
@@ -107,11 +133,6 @@ class RoomRecorderBot:
         self.start_mono = time.monotonic()
         self.start_wall_time = time.time()
         self.is_running = True
-        logger.info(
-            "Khởi động RoomRecorderBot cho phòng '%s' (session=%s)...",
-            self.room_name,
-            self.session_id,
-        )
 
         @self.room.on("track_subscribed")
         def on_track_subscribed(
@@ -139,7 +160,6 @@ class RoomRecorderBot:
                 try:
                     if getattr(publication, "simulcasted", False):
                         publication.set_video_quality(rtc.VideoQuality.VIDEO_QUALITY_HIGH)
-                        logger.info("Đã request VIDEO_QUALITY_HIGH cho screen %s", publication.sid)
                 except Exception as e:
                     logger.warning("Không set được video quality: %s", e)
 
@@ -253,6 +273,11 @@ class RoomRecorderBot:
 
         stream = rtc.VideoStream(track)
 
+        out_w = settings.VIDEO_WIDTH
+        out_h = settings.VIDEO_HEIGHT
+        bitrate = settings.VIDEO_BITRATE
+        cpu_used = settings.VIDEO_CPU_USED
+
         pipeline = None
         appsrc = None
         frame_count = 0
@@ -273,25 +298,26 @@ class RoomRecorderBot:
                     main_loop.quit()
             return True
 
-        def start_pipeline(w: int, h: int):
+        def start_pipeline():
             nonlocal pipeline, appsrc, main_loop, loop_thread
 
             pipeline_str = (
                 f"appsrc name=src is-live=true format=time do-timestamp=false "
+                f"! video/x-raw,format=RGB,width={out_w},height={out_h},framerate=30/1 "
                 f"! videoconvert "
-                f"! vp8enc deadline=1 cpu-used=6 target-bitrate=2500000 "
+                f"! vp8enc deadline=1 cpu-used={cpu_used} target-bitrate={bitrate} "
                 f"! webmmux "
-                f"! filesink location={webm_path}"
+                f"! filesink location=\"{webm_path.as_posix()}\""
             )
 
             pipeline = Gst.parse_launch(pipeline_str)
             appsrc = pipeline.get_by_name("src")
+            appsrc.set_property("format", Gst.Format.TIME)
 
             caps = Gst.Caps.from_string(
-                f"video/x-raw,format=RGB,width={w},height={h},framerate=30/1"
+                f"video/x-raw,format=RGB,width={out_w},height={out_h},framerate=30/1"
             )
             appsrc.set_property("caps", caps)
-            appsrc.set_property("format", Gst.Format.TIME)
 
             bus = pipeline.get_bus()
             bus.add_signal_watch()
@@ -302,13 +328,23 @@ class RoomRecorderBot:
             loop_thread.start()
 
             pipeline.set_state(Gst.State.PLAYING)
-            logger.info("GStreamer pipeline đã chạy: %dx%d → %s", w, h, webm_path.name)
+            logger.info(
+                "GStreamer pipeline đã chạy (preset=%s, %dx%d, bitrate=%d, cpu_used=%d) → %s",
+                settings.VIDEO_PRESET,
+                out_w,
+                out_h,
+                bitrate,
+                cpu_used,
+                webm_path.name,
+            )
 
         def push_frame(rgb: np.ndarray, frame_us: int):
             nonlocal frame_count, first_frame_us
 
             if appsrc is None:
                 return
+            
+            assert rgb.shape[0] == out_h and rgb.shape[1] == out_w and rgb.shape[2] == 3
 
             if first_frame_us is None:
                 first_frame_us = frame_us
@@ -337,9 +373,10 @@ class RoomRecorderBot:
                 rgb = arr[:h2, :w2, :][:, :, [2, 1, 0]].copy()
 
                 if pipeline is None:
-                    start_pipeline(w2, h2)
+                    start_pipeline()
 
-                push_frame(rgb, event.timestamp_us)
+                rgb_fixed = fit_to_canvas(rgb, out_w, out_h)
+                push_frame(rgb_fixed, event.timestamp_us)
 
         except asyncio.CancelledError:
             pass
@@ -600,18 +637,24 @@ class RoomRecorderBot:
                 e,
             )
             return False
+    
+    async def signal_stopped_and_leave(self) -> None:
+        """Báo UI + rời room ngay; chưa cancel encode / chưa ghi timeline."""
+        self.is_running = False
+        try:
+            await self.publish_recording_status(is_recording=False)
+            await asyncio.sleep(0.05)  # cho data channel kịp gửi
+        except Exception as e:
+            logger.warning("signal stop data channel: %s", e)
+
+        try:
+            await self.room.disconnect()
+        except Exception as e:
+            logger.warning("disconnect: %s", e)
 
     async def stop(self) -> Dict[str, Any]:
         """Dừng bot, huỷ các task ghi, ngắt kết nối LiveKit và lưu timeline.json."""
         self.is_running = False
-        logger.info("Đang dừng bot ghi hình phòng '%s'...", self.room_name)
-
-        # Phát thông báo is_recording=False qua data channel trước khi ngắt kết nối
-        try:
-            await self.publish_recording_status(is_recording=False)
-            await asyncio.sleep(0.1)  # Đợi 100ms để gói tin truyền qua DataChannel
-        except Exception as e:
-            logger.warning("Lỗi khi phát trạng thái dừng qua Data Channel: %s", e)
 
         # Cancel toàn bộ tasks ghi stream
         for t in self._tasks:
@@ -621,16 +664,11 @@ class RoomRecorderBot:
             try:
                 await asyncio.wait_for(
                     asyncio.gather(*self._tasks, return_exceptions=True),
-                    timeout=15.0,
+                    timeout=5.0,
                 )
             except asyncio.TimeoutError:
                 logger.warning("Timeout khi chờ các task ghi kết thúc")
             self._tasks.clear()
-
-        try:
-            await self.room.disconnect()
-        except Exception as e:
-            logger.warning("Lỗi khi ngắt kết nối room: %s", e)
 
         duration = self.now() if self.start_mono is not None else 0.0
 

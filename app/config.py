@@ -6,6 +6,12 @@ from dotenv import load_dotenv
 # Tải cấu hình từ .env
 load_dotenv()
 
+# Video Presets cho GStreamer Screen Recording
+VIDEO_PRESETS = {
+    "720p": {"width": 1280, "height": 720, "bitrate": 2_500_000, "cpu_used": 6},
+    "1080p": {"width": 1920, "height": 1080, "bitrate": 5_000_000, "cpu_used": 4},
+}
+
 class Settings:
     # LiveKit Configuration
     LIVEKIT_URL: str = os.getenv("LIVEKIT_URL", "ws://localhost:7880")
@@ -33,6 +39,33 @@ class Settings:
 
     # Webhook Configuration
     WEBHOOK_URL: str = os.getenv("WEBHOOK_URL", "")
+
+    # Video Recording Configuration (GStreamer)
+    VIDEO_PRESET: str = os.getenv("VIDEO_PRESET", "1080p")
+
+    @property
+    def video_preset_config(self) -> dict:
+        """Lấy cấu hình preset video. Mặc định 1080p nếu preset không tồn tại."""
+        preset_key = self.VIDEO_PRESET.lower()
+        if preset_key in VIDEO_PRESETS:
+            return VIDEO_PRESETS[preset_key]
+        return VIDEO_PRESETS["1080p"]
+
+    @property
+    def VIDEO_WIDTH(self) -> int:
+        return int(os.getenv("VIDEO_WIDTH", self.video_preset_config["width"]))
+
+    @property
+    def VIDEO_HEIGHT(self) -> int:
+        return int(os.getenv("VIDEO_HEIGHT", self.video_preset_config["height"]))
+
+    @property
+    def VIDEO_BITRATE(self) -> int:
+        return int(os.getenv("VIDEO_BITRATE", self.video_preset_config["bitrate"]))
+
+    @property
+    def VIDEO_CPU_USED(self) -> int:
+        return int(os.getenv("VIDEO_CPU_USED", self.video_preset_config["cpu_used"]))
 
     @property
     def R2_ENDPOINT_URL(self) -> str:

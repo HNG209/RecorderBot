@@ -164,11 +164,9 @@ async def stop_recording(request: StopRecordingRequest, background_tasks: Backgr
         )
 
     try:
-        # pop_bot() chỉ xóa bot khỏi active list và set is_running=False — không I/O, không block.
-        # FastAPI BackgroundTasks đảm bảo response 204 được gửi đến client TRƯỚC KHI
-        # bất kỳ tác vụ background nào bắt đầu — khác với asyncio.create_task
-        # có thể chạy xen kế với quá trình gửi response.
         bot = recorder_manager.pop_bot(room_name)
+        await bot.signal_stopped_and_leave()
+
         background_tasks.add_task(
             recorder_manager.run_stop_background_task,
             bot,
@@ -220,7 +218,6 @@ async def get_room_status(room_name: str):
         "room_name": room_name,
         "is_recording": bot.is_running,
     }
-
 
 if __name__ == "__main__":
     uvicorn.run(
