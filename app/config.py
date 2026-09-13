@@ -8,8 +8,8 @@ load_dotenv()
 
 # Video Presets cho GStreamer Screen Recording
 VIDEO_PRESETS = {
-    "720p": {"width": 1280, "height": 720, "bitrate": 2_500_000, "cpu_used": 6},
-    "1080p": {"width": 1920, "height": 1080, "bitrate": 5_000_000, "cpu_used": 4},
+    "720p": {"width": 1280, "height": 720, "bitrate": 2_500_000, "cpu_used": 6, "fps": 30},
+    "1080p": {"width": 1920, "height": 1080, "bitrate": 5_000_000, "cpu_used": 4, "fps": 30},
 }
 
 class Settings:
@@ -58,6 +58,10 @@ class Settings:
     @property
     def VIDEO_HEIGHT(self) -> int:
         return int(os.getenv("VIDEO_HEIGHT", self.video_preset_config["height"]))
+
+    @property
+    def VIDEO_FPS(self) -> int:
+        return int(os.getenv("VIDEO_FPS", self.video_preset_config.get("fps", 30)))
 
     @property
     def VIDEO_BITRATE(self) -> int:

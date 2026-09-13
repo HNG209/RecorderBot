@@ -254,12 +254,20 @@ class RoomRecorderBot:
     async def _record_screen_gstreamer(
         self, track: rtc.Track, participant: rtc.RemoteParticipant
     ) -> None:
-        """Ghi screen share bằng GStreamer pipeline."""
+        """Ghi screen share bằng GStreamer pipeline.
+
+        Kiến trúc:
+        - Event loop (async): chỉ nhận VideoFrame object + timestamp rồi đẩy vào queue,
+          KHÔNG làm bất kỳ tính toán nào.
+        - Worker thread: thực hiện toàn bộ công việc nặng (convert → BGRA → numpy reshape
+          → channel swap → fit_to_canvas → push_frame vào appsrc) để không chặn event loop.
+        """
         # pyrefly: ignore [missing-import]
         import gi
         gi.require_version("Gst", "1.0")
         # pyrefly: ignore [missing-import]
         from gi.repository import Gst, GLib
+        import queue
         import threading
 
         Gst.init(None)
@@ -275,12 +283,23 @@ class RoomRecorderBot:
 
         out_w = settings.VIDEO_WIDTH
         out_h = settings.VIDEO_HEIGHT
+        fps = settings.VIDEO_FPS
         bitrate = settings.VIDEO_BITRATE
         cpu_used = settings.VIDEO_CPU_USED
 
+        # Queue truyền VideoFrame object từ event loop → worker thread.
+        # Mỗi item: (frame: rtc.VideoFrame, timestamp_us: int)
+        # Truyền object (không copy bytes) để event loop nhẹ tối đa;
+        # worker giữ ref nên frame không bị GC sớm.
+        # maxsize = max(30, fps * 3) ≈ ~3 giây frame để tránh RAM tăng vô hạn khi worker bị chậm.
+        frame_queue: queue.Queue = queue.Queue(maxsize=max(30, fps * 3))
+
+        # Biến chia sẻ (chỉ worker thread ghi, main thread đọc sau khi join)
+        frame_count = 0
+        encode_error: Exception | None = None
+
         pipeline = None
         appsrc = None
-        frame_count = 0
         first_frame_us: int | None = None
         main_loop = None
         loop_thread = None
@@ -303,7 +322,7 @@ class RoomRecorderBot:
 
             pipeline_str = (
                 f"appsrc name=src is-live=true format=time do-timestamp=false "
-                f"! video/x-raw,format=RGB,width={out_w},height={out_h},framerate=30/1 "
+                f"! video/x-raw,format=RGB,width={out_w},height={out_h},framerate={fps}/1 "
                 f"! videoconvert "
                 f"! vp8enc deadline=1 cpu-used={cpu_used} target-bitrate={bitrate} "
                 f"! webmmux "
@@ -315,7 +334,7 @@ class RoomRecorderBot:
             appsrc.set_property("format", Gst.Format.TIME)
 
             caps = Gst.Caps.from_string(
-                f"video/x-raw,format=RGB,width={out_w},height={out_h},framerate=30/1"
+                f"video/x-raw,format=RGB,width={out_w},height={out_h},framerate={fps}/1"
             )
             appsrc.set_property("caps", caps)
 
@@ -329,71 +348,136 @@ class RoomRecorderBot:
 
             pipeline.set_state(Gst.State.PLAYING)
             logger.info(
-                "GStreamer pipeline đã chạy (preset=%s, %dx%d, bitrate=%d, cpu_used=%d) → %s",
+                "GStreamer pipeline đã chạy (preset=%s, %dx%d @ %dfps, bitrate=%d, cpu_used=%d) → %s",
                 settings.VIDEO_PRESET,
                 out_w,
                 out_h,
+                fps,
                 bitrate,
                 cpu_used,
                 webm_path.name,
             )
 
-        def push_frame(rgb: np.ndarray, frame_us: int):
-            nonlocal frame_count, first_frame_us
+        def gstreamer_worker():
+            """Worker thread: convert BGRA → numpy → fit_to_canvas → push_frame.
+            Toàn bộ tính toán nặng chạy ở đây, KHÔNG trên event loop.
+            """
+            nonlocal frame_count, encode_error, pipeline, appsrc, first_frame_us
 
-            if appsrc is None:
-                return
-            
-            assert rgb.shape[0] == out_h and rgb.shape[1] == out_w and rgb.shape[2] == 3
+            try:
+                while True:
+                    item = frame_queue.get()
+                    if item is None:  # sentinel → kết thúc
+                        break
 
-            if first_frame_us is None:
-                first_frame_us = frame_us
+                    raw_frame, timestamp_us = item
 
-            pts_ns = (frame_us - first_frame_us) * 1000  # µs → ns
+                    # --- Khởi tạo GStreamer pipeline khi nhận frame đầu tiên ---
+                    if pipeline is None:
+                        start_pipeline()
 
-            data = rgb.tobytes()
-            buf = Gst.Buffer.new_allocate(None, len(data), None)
-            buf.fill(0, data)
-            buf.pts = pts_ns
-            buf.duration = Gst.util_uint64_scale_int(1, Gst.SECOND, 30)
+                    # --- Convert pixel format → BGRA (CPU-bound, offloaded hoàn toàn) ---
+                    frame_bgra = raw_frame.convert(rtc.VideoBufferType.BGRA)
+                    src_w, src_h = frame_bgra.width, frame_bgra.height
 
-            ret = appsrc.emit("push-buffer", buf)
-            if ret == Gst.FlowReturn.OK:
-                frame_count += 1
+                    # --- BGRA bytes → RGB numpy array ---
+                    arr = np.frombuffer(frame_bgra.data, dtype=np.uint8).reshape(src_h, src_w, 4)
+                    w2 = src_w - (src_w % 2)
+                    h2 = src_h - (src_h % 2)
+                    rgb = arr[:h2, :w2, :][:, :, [2, 1, 0]].copy()
+
+                    # --- fit_to_canvas (resize bằng OpenCV) ---
+                    rgb_fixed = fit_to_canvas(rgb, out_w, out_h)
+
+                    # --- Push frame vào GStreamer appsrc ---
+                    assert rgb_fixed.shape == (out_h, out_w, 3)
+
+                    if first_frame_us is None:
+                        first_frame_us = timestamp_us
+
+                    pts_ns = (timestamp_us - first_frame_us) * 1000  # µs → ns
+
+                    data = rgb_fixed.tobytes()
+                    buf = Gst.Buffer.new_allocate(None, len(data), None)
+                    buf.fill(0, data)
+                    buf.pts = pts_ns
+                    buf.duration = Gst.util_uint64_scale_int(1, Gst.SECOND, fps)
+
+                    ret = appsrc.emit("push-buffer", buf)
+                    if ret == Gst.FlowReturn.OK:
+                        frame_count += 1
+
+            except Exception as e:
+                encode_error = e
+                logger.exception(
+                    "Lỗi trong GStreamer worker của %s: %s", participant.identity, e
+                )
+
+        # Khởi động worker thread (daemon để không chặn process khi tắt app)
+        worker = threading.Thread(
+            target=gstreamer_worker,
+            name=f"gst-worker-{safe_id}",
+            daemon=True,
+        )
+        worker.start()
 
         try:
+            frame_interval_us = 1_000_000 // fps  # µs giữa 2 frame liên tiếp (VD: 15fps → 66666µs)
+            last_enqueued_us: int = -1
+
             async for event in stream:
-                frame = event.frame
-                frame_bgra = frame.convert(rtc.VideoBufferType.BGRA)
-                w, h = frame_bgra.width, frame_bgra.height
-                w2 = w - (w % 2)
-                h2 = h - (h % 2)
+                ts = event.timestamp_us
 
-                arr = np.frombuffer(frame_bgra.data, dtype=np.uint8).reshape(h, w, 4)
-                rgb = arr[:h2, :w2, :][:, :, [2, 1, 0]].copy()
+                # --- Frame throttle: drop frame nếu chưa đủ 1 frame-interval kể từ frame trước ---
+                # Đây là cách duy nhất để giảm CPU thực sự khi VIDEO_FPS < fps nguồn.
+                # Phép so sánh số nguyên rất nhẹ, hoàn toàn OK trên event loop.
+                if last_enqueued_us >= 0 and (ts - last_enqueued_us) < frame_interval_us:
+                    continue
 
-                if pipeline is None:
-                    start_pipeline()
+                last_enqueued_us = ts
 
-                rgb_fixed = fit_to_canvas(rgb, out_w, out_h)
-                push_frame(rgb_fixed, event.timestamp_us)
+                # Event loop chỉ đẩy frame object + timestamp vào queue;
+                # KHÔNG thực hiện bất kỳ tính toán nào (convert, numpy, OpenCV).
+                # Worker thread giữ reference → frame không bị GC sớm.
+                try:
+                    frame_queue.put_nowait((event.frame, ts))
+                except queue.Full:
+                    # Worker đang bị chậm → drop frame thay vì block event loop
+                    pass
 
         except asyncio.CancelledError:
             pass
         except Exception as e:
             logger.exception("Lỗi khi đọc Video stream từ %s: %s", participant.identity, e)
         finally:
+            # Báo worker dừng lại và chờ flush xong
+            try:
+                frame_queue.put(None, timeout=1.0)
+            except Exception:
+                pass
+
+            worker.join(timeout=15.0)
+
+            if worker.is_alive():
+                logger.warning(
+                    "GStreamer worker của %s vẫn còn chạy sau 15s, bỏ qua chờ thêm",
+                    participant.identity,
+                )
+
             if appsrc is not None:
                 appsrc.emit("end-of-stream")
 
             if loop_thread is not None:
-                loop_thread.join(timeout=15.0)
+                loop_thread.join(timeout=5.0)
 
             if pipeline is not None:
                 pipeline.set_state(Gst.State.NULL)
 
             end_ts = self.now()
             real_dur = round(end_ts - start_ts, 3)
+
+            if encode_error:
+                logger.error("GStreamer worker kết thúc với lỗi: %s", encode_error)
 
             seg = {
                 "participant": participant.identity,
@@ -431,9 +515,13 @@ class RoomRecorderBot:
 
         stream = rtc.VideoStream(track)
 
+        fps = settings.VIDEO_FPS
+        FPS = fps
+        TIME_BASE = Fraction(1, 1_000_000)
+
         # Queue truyền frame từ async task → worker thread
-        # maxsize=90 ≈ giữ tối đa ~3 giây frame (30fps) để tránh RAM tăng vô hạn
-        frame_queue: queue.Queue = queue.Queue(maxsize=90)
+        # maxsize = max(30, FPS * 3) ≈ giữ tối đa ~3 giây frame để tránh RAM tăng vô hạn
+        frame_queue: queue.Queue = queue.Queue(maxsize=max(30, FPS * 3))
 
         # Các biến dùng chung (chỉ worker thread ghi, main thread chỉ đọc ở cuối)
         frame_count = 0
@@ -443,11 +531,8 @@ class RoomRecorderBot:
         stream_out = None
         encode_error: Exception | None = None
 
-        FPS = 30
-        TIME_BASE = Fraction(1, 1_000_000)
-
         def encoder_worker():
-            """Chạy trên 1 thread riêng, chuyên encode + mux."""
+            """Chạy trên 1 thread riêng, chuyên convert + encode + mux."""
             nonlocal writer, stream_out, frame_count, last_pts, first_frame_us, encode_error
 
             try:
@@ -456,28 +541,42 @@ class RoomRecorderBot:
                     if item is None:          # sentinel → kết thúc
                         break
 
-                    rgb, frame_us, w2, h2 = item
+                    raw_frame, frame_us = item
+
+                    # --- Convert pixel format → BGRA (CPU-bound, chạy trên thread) ---
+                    frame_bgra = raw_frame.convert(rtc.VideoBufferType.BGRA)
+                    src_w, src_h = frame_bgra.width, frame_bgra.height
+                    w2 = src_w - (src_w % 2)
+                    h2 = src_h - (src_h % 2)
+
+                    arr = np.frombuffer(frame_bgra.data, dtype=np.uint8).reshape(src_h, src_w, 4)
+                    rgb = arr[:h2, :w2, :][:, :, [2, 1, 0]].copy()
+
+                    # --- fit_to_canvas để output đúng kích thước cấu hình ---
+                    rgb = fit_to_canvas(rgb)
+
+                    out_h, out_w = rgb.shape[:2]
 
                     # Khởi tạo encoder khi nhận frame đầu tiên
                     if writer is None:
                         logger.info(
                             "Screen nhận frame đầu: %dx%d từ %s",
-                            w2, h2, participant.identity,
+                            out_w, out_h, participant.identity,
                         )
                         writer = av.open(str(webm_path), mode="w", format="webm")
                         stream_out = writer.add_stream("libvpx", rate=FPS)
-                        stream_out.width = w2
-                        stream_out.height = h2
+                        stream_out.width = out_w
+                        stream_out.height = out_h
                         stream_out.pix_fmt = "yuv420p"
                         stream_out.time_base = TIME_BASE
-                        stream_out.bit_rate = 2_500_000          # giảm nhẹ so với trước
+                        stream_out.bit_rate = 2_500_000
                         stream_out.options = {
-                            "deadline": "realtime",               # ưu tiên tốc độ
-                            "cpu-used": "6",                      # 0=chậm-chất lượng cao, 8=nhanh
+                            "deadline": "realtime",
+                            "cpu-used": "6",
                             "crf": "18",
                             "threads": "2",
                         }
-                        logger.info("Khởi tạo WebM encoder %dx%d -> %s", w2, h2, webm_path.name)
+                        logger.info("Khởi tạo WebM encoder %dx%d @ %dfps -> %s", out_w, out_h, FPS, webm_path.name)
 
                     if first_frame_us is None:
                         first_frame_us = frame_us
@@ -519,23 +618,22 @@ class RoomRecorderBot:
         worker.start()
 
         try:
+            frame_interval_us = 1_000_000 // FPS  # µs giữa 2 frame liên tiếp
+            last_enqueued_us: int = -1
+
             async for event in stream:
-                frame = event.frame
-                frame_bgra = frame.convert(rtc.VideoBufferType.BGRA)
-                w, h = frame_bgra.width, frame_bgra.height
-                w2 = w - (w % 2)
-                h2 = h - (h % 2)
+                ts = event.timestamp_us
 
-                arr = np.frombuffer(frame_bgra.data, dtype=np.uint8).reshape(h, w, 4)
-                rgb = arr[:h2, :w2, :][:, :, [2, 1, 0]].copy()
+                # --- Frame throttle: drop frame nếu chưa đủ 1 frame-interval ---
+                if last_enqueued_us >= 0 and (ts - last_enqueued_us) < frame_interval_us:
+                    continue
 
-                frame_us: int = event.timestamp_us
+                last_enqueued_us = ts
 
-                # Đưa frame vào queue. Nếu queue đầy → bỏ frame (tránh block + tăng RAM)
+                # Chỉ enqueue frame object; worker tự convert/reshape/encode
                 try:
-                    frame_queue.put_nowait((rgb, frame_us, w2, h2))
+                    frame_queue.put_nowait((event.frame, ts))
                 except queue.Full:
-                    # Có thể log thỉnh thoảng nếu muốn theo dõi drop frame
                     pass
 
         except asyncio.CancelledError:
@@ -727,7 +825,15 @@ class RecorderManager:
         room_name: str,
         session_id: Optional[str] = None,
     ) -> RoomRecorderBot:
-        """Khởi chạy ghi âm/hình cho một phòng LiveKit."""
+        """Khởi chạy ghi âm/hình cho một phòng LiveKit.
+
+        Flow:
+        1. Tạo bot và đăng ký vào _active_bots.
+        2. bot.start(): connect → publish is_recording=True → scan tracks có sẵn.
+        3. Publish lại is_recording=True ngay sau khi bot đã join và scan xong,
+           đảm bảo tất cả participants hiện có trong phòng đều nhận được trạng thái mới nhất
+           (bảo vệ khỏi trường hợp Data Channel chưa kịp subscribe ở lần publish đầu).
+        """
         if self.is_recording(room_name):
             raise ValueError(f"Phòng '{room_name}' hiện đang được ghi hình.")
 
@@ -739,6 +845,11 @@ class RecorderManager:
 
         try:
             await bot.start()
+
+            # Publish lại sau khi bot đã join + scan tracks xong,
+            # đảm bảo clients đang online nhận được trạng thái is_recording=True.
+            await bot.publish_recording_status(is_recording=True)
+
             return bot
         except Exception as e:
             self._active_bots.pop(room_name, None)
